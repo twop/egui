@@ -168,6 +168,11 @@ pub fn window_builder<E>(
             }
         }
     }
+
+    if let Some(hook) = std::mem::take(&mut native_options.window_builder) {
+        hook(&mut window_builder);
+    }
+
     window_builder
 }
 
