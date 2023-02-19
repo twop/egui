@@ -73,7 +73,7 @@ pub fn read_window_info(
 pub fn window_builder<E>(
     event_loop: &EventLoopWindowTarget<E>,
     title: &str,
-    native_options: &epi::NativeOptions,
+    native_options: &mut epi::NativeOptions,
     window_settings: Option<WindowSettings>,
 ) -> winit::window::WindowBuilder {
     let epi::NativeOptions {
@@ -167,10 +167,6 @@ pub fn window_builder<E>(
                 window_builder = window_builder.with_position(winit::dpi::LogicalPosition { x, y });
             }
         }
-    }
-
-    if let Some(hook) = std::mem::take(&mut native_options.window_builder) {
-        hook(&mut window_builder);
     }
 
     window_builder

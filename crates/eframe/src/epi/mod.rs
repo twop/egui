@@ -456,6 +456,9 @@ impl Clone for NativeOptions {
             #[cfg(any(feature = "glow", feature = "wgpu"))]
             event_loop_builder: None, // Skip any builder callbacks if cloning
 
+            #[cfg(any(feature = "glow", feature = "wgpu"))]
+            window_builder: None, // Skip any builder callbacks if cloning
+
             #[cfg(feature = "wgpu")]
             wgpu_options: self.wgpu_options.clone(),
 
@@ -509,6 +512,9 @@ impl Default for NativeOptions {
 
             #[cfg(any(feature = "glow", feature = "wgpu"))]
             event_loop_builder: None,
+
+            #[cfg(any(feature = "glow", feature = "wgpu"))]
+            window_builder: None,
 
             #[cfg(feature = "glow")]
             shader_version: None,
