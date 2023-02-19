@@ -545,6 +545,10 @@ impl EpiIntegration {
         if let Some(visible) = self.frame.output.visible.take() {
             window.set_visible(visible);
         }
+
+        if self.frame.output.focus_window.take() == Some(true) {
+            window.focus_window();
+        }
     }
 
     pub fn handle_platform_output(

@@ -950,7 +950,7 @@ impl Frame {
     /// Please use with caution.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn focus_window(&mut self) {
-        self.output.focus_window = true;
+        self.output.focus_window = Some(true);
     }
 
     /// On desktop: Set the window to be centered.
