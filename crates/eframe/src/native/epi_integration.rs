@@ -169,7 +169,10 @@ pub fn window_builder<E>(
         }
     }
 
-    window_builder
+    match std::mem::take(&mut native_options.window_builder) {
+        Some(hook) => hook(window_builder),
+        None => window_builder,
+    }
 }
 
 pub fn apply_native_options_to_window(

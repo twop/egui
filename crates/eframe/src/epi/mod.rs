@@ -37,7 +37,7 @@ pub type EventLoopBuilderHook = Box<dyn FnOnce(&mut EventLoopBuilder<UserEvent>)
 /// done by `EFrame`.
 #[cfg(not(target_arch = "wasm32"))]
 #[cfg(any(feature = "glow", feature = "wgpu"))]
-pub type WindowBuilderHook = Box<dyn FnOnce(&mut WindowBuilder)>;
+pub type WindowBuilderHook = Box<dyn FnOnce(WindowBuilder) -> WindowBuilder>;
 
 /// This is how your app is created.
 ///
