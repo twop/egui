@@ -945,14 +945,6 @@ impl Frame {
         self.output.always_on_top = Some(always_on_top);
     }
 
-    /// On desktop: Ask OS to focus the native window.
-    /// Note that this can be disruptive to the user flow.
-    /// Please use with caution.
-    #[cfg(not(target_arch = "wasm32"))]
-    pub fn focus_window(&mut self) {
-        self.output.focus_window = Some(true);
-    }
-
     /// On desktop: Set the window to be centered.
     ///
     /// (Wayland desktop currently not supported)
