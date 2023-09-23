@@ -10,7 +10,7 @@ use egui::NumExt as _;
 use egui_winit::accesskit_winit;
 use egui_winit::{native_pixels_per_point, EventResponse, WindowSettings};
 
-use crate::{epi, Theme, WindowInfo};
+use crate::{backend::AppOutput, epi, Theme, WindowInfo};
 
 #[derive(Default)]
 pub struct WindowState {
@@ -299,19 +299,6 @@ pub fn handle_app_output(
         window.set_maximized(maximized);
         window_state.maximized = maximized;
     }
-
-    if !window.has_focus() {
-        if focus == Some(true) {
-            window.focus_window();
-        } else if let Some(attention) = attention {
-            use winit::window::UserAttentionType;
-            window.request_user_attention(match attention {
-                egui::UserAttentionType::Reset => None,
-                egui::UserAttentionType::Critical => Some(UserAttentionType::Critical),
-                egui::UserAttentionType::Informational => Some(UserAttentionType::Informational),
-            });
-        }
-    }
 }
 
 // ----------------------------------------------------------------------------
@@ -542,8 +529,29 @@ impl EpiIntegration {
     }
 
     pub fn post_present(&mut self, window: &winit::window::Window) {
-        if let Some(visible) = self.frame.output.visible.take() {
+        let AppOutput {
+            visible,
+            attention,
+            focus,
+            ..
+        } = &mut self.frame.output;
+        if let Some(visible) = visible.take() {
             window.set_visible(visible);
+        }
+
+        if !window.has_focus() {
+            if focus == &Some(true) {
+                window.focus_window();
+            } else if let Some(attention) = attention {
+                use winit::window::UserAttentionType;
+                window.request_user_attention(match attention {
+                    egui::UserAttentionType::Reset => None,
+                    egui::UserAttentionType::Critical => Some(UserAttentionType::Critical),
+                    egui::UserAttentionType::Informational => {
+                        Some(UserAttentionType::Informational)
+                    }
+                });
+            }
         }
     }
 
