@@ -540,7 +540,8 @@ impl EpiIntegration {
         }
 
         if !window.has_focus() {
-            if focus == &Some(true) {
+            if let Some(true) = focus {
+                println!("focusing window");
                 window.focus_window();
             } else if let Some(attention) = attention {
                 use winit::window::UserAttentionType;
