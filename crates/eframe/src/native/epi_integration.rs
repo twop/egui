@@ -244,8 +244,8 @@ pub fn handle_app_output(
         screenshot_requested: _, // handled by the rendering backend,
         minimized,
         maximized,
-        focus,
-        attention,
+        focus: _,
+        attention: _,
     } = app_output;
 
     if let Some(decorated) = decorated {
@@ -503,6 +503,7 @@ impl EpiIntegration {
                 log::debug!("App::on_close_event returned {}", self.close);
             }
             self.frame.output.visible = app_output.visible; // this is handled by post_present
+            self.frame.output.focus = app_output.focus; // this is handled by post_present
             self.frame.output.screenshot_requested = app_output.screenshot_requested;
             if self.frame.output.attention.is_some() {
                 self.frame.output.attention = None;
@@ -541,7 +542,6 @@ impl EpiIntegration {
 
         if !window.has_focus() {
             if let Some(true) = focus {
-                println!("focusing window");
                 window.focus_window();
             } else if let Some(attention) = attention {
                 use winit::window::UserAttentionType;
