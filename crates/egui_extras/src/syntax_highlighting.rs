@@ -592,6 +592,7 @@ impl Highlighter {
                 };
                 job.sections.push(LayoutSection {
                     leading_space: 0.0,
+                    hanging_indent: 0.0,
                     byte_range: as_byte_range(text, range),
                     format: TextFormat {
                         font_id: theme.font_id.clone(),

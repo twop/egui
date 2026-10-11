@@ -2214,6 +2214,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "hanging_indent"
+version = "0.1.0"
+dependencies = [
+ "eframe",
+ "env_logger",
+]
+
+[[package]]
 name = "harfrust"
 version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

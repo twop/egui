@@ -184,6 +184,7 @@ impl GalleyCache {
             for section in &job.sections[current_section..job.sections.len()] {
                 let LayoutSection {
                     leading_space,
+                    hanging_indent,
                     byte_range: section_range,
                     format,
                 } = section;
@@ -214,6 +215,9 @@ impl GalleyCache {
                         } else {
                             0.0
                         },
+                        // Unlike `leading_space`, this applies to every paragraph
+                        // starting in this section, so we always keep it:
+                        hanging_indent: *hanging_indent,
                         byte_range: new_range,
                         format: format.clone(),
                     });
@@ -269,7 +273,7 @@ fn should_cache_each_paragraph_individually(job: &LayoutJob) -> bool {
 #[cfg(feature = "default_fonts")]
 #[cfg(test)]
 mod tests {
-    use core::f32;
+    use core::{f32, iter};
 
     use super::*;
     use crate::text::{FontDefinitions, FontFamily, FontId, TextOptions, TextWrapping};
@@ -368,7 +372,86 @@ mod tests {
                 job.append("", 0.0, TextFormat::default());
                 job
             },
+            bullet_list_job("a continuation line that is also long enough to wrap"),
         ]
+    }
+
+    /// A markdown-like list, with a hanging indent so wrapped text aligns after the bullet.
+    fn bullet_list_job(continuation: &str) -> LayoutJob {
+        let indent = 16.0;
+        let lines = [
+            (
+                "- a bullet point that is long enough to wrap\n",
+                0.0,
+                indent,
+            ),
+            (&format!("{continuation}\n"), indent, indent),
+            (
+                "  - a nested bullet point that also wraps\n",
+                0.0,
+                2.0 * indent,
+            ),
+            ("not in the list, and long enough to wrap", 0.0, 0.0),
+        ];
+
+        let mut job = LayoutJob {
+            wrap: TextWrapping::wrap_at_width(120.0),
+            ..Default::default()
+        };
+        for (text, leading_space, hanging_indent) in lines {
+            let start = job.text.len();
+            job.text += text;
+            job.sections.push(LayoutSection {
+                leading_space,
+                hanging_indent,
+                byte_range: ByteIndex(start)..ByteIndex(job.text.len()),
+                format: TextFormat::simple(FontId::proportional(14.0), Color32::WHITE),
+            });
+        }
+        job
+    }
+
+    #[test]
+    fn test_hanging_indent_edit_one_paragraph() {
+        let pixels_per_point = 1.0;
+        let mut fonts = FontsImpl::new(TextOptions::default(), FontDefinitions::default());
+        let mut cache = GalleyCache::default();
+
+        let before = bullet_list_job("a continuation line that is also long enough to wrap");
+        let after = bullet_list_job("an edited continuation, which is long enough to wrap");
+
+        let galley_before = cache.layout(&mut fonts, pixels_per_point, before, true);
+        let galley_after = cache.layout(&mut fonts, pixels_per_point, after.clone(), true);
+        let galley_whole =
+            GalleyCache::default().layout(&mut fonts, pixels_per_point, after, false);
+
+        similar_asserts::assert_eq!(
+            format!("{galley_after:#.1?}"),
+            format!("{galley_whole:#.1?}"),
+        );
+
+        // The edited paragraph is the second one. Rows of the other paragraphs should be
+        // reused from the cache, and still be indented:
+        let num_bullet_rows = galley_before
+            .rows
+            .iter()
+            .position(|row| row.ends_with_newline)
+            .unwrap()
+            + 1;
+        for (row_before, row_after) in iter::zip(
+            &galley_before.rows[..num_bullet_rows],
+            &galley_after.rows[..num_bullet_rows],
+        ) {
+            assert!(Arc::ptr_eq(&row_before.row, &row_after.row));
+            assert_eq!(row_before.pos, row_after.pos);
+        }
+        assert!(2 <= num_bullet_rows);
+        assert_eq!(galley_after.rows[1].pos.x, 16.0);
+
+        let last_row_before = galley_before.rows.last().unwrap();
+        let last_row_after = galley_after.rows.last().unwrap();
+        assert!(Arc::ptr_eq(&last_row_before.row, &last_row_after.row));
+        assert_eq!(last_row_before.pos.x, last_row_after.pos.x);
     }
 
     #[expect(clippy::print_stdout)]
@@ -410,6 +493,24 @@ mod tests {
                                 row.row.section_index_at_start,
                                 row.row.glyphs.first().map(|g| g.section_index)
                             );
+                        }
+
+                        // A row that doesn't start at x=0 (e.g. with a hanging indent) at a fractional
+                        // `pixels_per_point` can make the galley rect differ by a GUI rounding step:
+                        // `Galley::concat` adds the row position to the already rounded row size,
+                        // while the whole layout rounds the sum.
+                        let mut split = (*split).clone();
+                        for (split_x, whole_x) in [
+                            (&mut split.rect.min.x, whole.rect.min.x),
+                            (&mut split.rect.max.x, whole.rect.max.x),
+                        ] {
+                            assert!(
+                                (*split_x - whole_x).abs() <= emath::GUI_ROUNDING,
+                                "Galley rect differs: {split_x} vs {whole_x}. \
+                                 pixels_per_point: {pixels_per_point:.2}, input text: '{}'",
+                                job.text
+                            );
+                            *split_x = whole_x;
                         }
 
                         // Don't compare for equaliity; but format with a specific precision and make sure we hit that.

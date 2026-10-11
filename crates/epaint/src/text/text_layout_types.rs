@@ -127,6 +127,7 @@ impl LayoutJob {
         Self {
             sections: vec![LayoutSection {
                 leading_space: 0.0,
+                hanging_indent: 0.0,
                 byte_range: ByteRange::full(&text),
                 format: TextFormat::simple(font_id, color),
             }],
@@ -146,6 +147,7 @@ impl LayoutJob {
         Self {
             sections: vec![LayoutSection {
                 leading_space: 0.0,
+                hanging_indent: 0.0,
                 byte_range: ByteRange::full(&text),
                 format,
             }],
@@ -161,6 +163,7 @@ impl LayoutJob {
         Self {
             sections: vec![LayoutSection {
                 leading_space: 0.0,
+                hanging_indent: 0.0,
                 byte_range: ByteRange::full(&text),
                 format: TextFormat::simple(font_id, color),
             }],
@@ -176,6 +179,7 @@ impl LayoutJob {
         Self {
             sections: vec![LayoutSection {
                 leading_space: 0.0,
+                hanging_indent: 0.0,
                 byte_range: ByteRange::full(&text),
                 format,
             }],
@@ -197,6 +201,8 @@ impl LayoutJob {
     /// `leading_space`, it is merged into that section instead of adding a new one.
     /// This keeps the section count down and lets text shaping (e.g. kerning) work
     /// across the appended text, since shaping is done per [`LayoutSection`].
+    ///
+    /// The new section has no [`LayoutSection::hanging_indent`].
     pub fn append(&mut self, text: &str, leading_space: f32, format: TextFormat) {
         let start = self.text.len();
         self.text += text;
@@ -204,9 +210,12 @@ impl LayoutJob {
 
         // Optimization: merge into the previous section if it has the same format
         // and this one adds no leading space.
+        // Don't merge into a section with a hanging indent, since that would
+        // extend the indent to any paragraph in the appended text.
         if leading_space == 0.0
             && let Some(last) = self.sections.last_mut()
             && last.format == format
+            && last.hanging_indent == 0.0
         {
             last.byte_range.end = byte_range.end;
             return;
@@ -214,6 +223,7 @@ impl LayoutJob {
 
         self.sections.push(LayoutSection {
             leading_space,
+            hanging_indent: 0.0,
             byte_range,
             format,
         });
@@ -348,6 +358,27 @@ pub struct LayoutSection {
     /// Can be used for first row indentation.
     pub leading_space: f32,
 
+    /// Hanging indent: the x position (in points) where soft-wrapped rows start.
+    ///
+    /// This applies to every row of a paragraph (text between `\n`) except its first row,
+    /// and is taken from the section containing the first character of the paragraph.
+    /// Use it together with [`Self::leading_space`] to also indent the first row,
+    /// e.g. for the continuation line of a list item:
+    ///
+    /// ```text
+    /// - a list item that is long  ← section with `hanging_indent = w`
+    ///   enough to wrap
+    ///   continuation after "\n"   ← section with `leading_space = w`, `hanging_indent = w`
+    ///   that also wraps
+    /// ```
+    ///
+    /// Wrapped rows wrap at `wrap.max_width - hanging_indent`.
+    /// The indent is clamped to `0..=wrap.max_width / 2`, so some text always fits.
+    ///
+    /// Only used with [`LayoutJob::halign`] set to [`Align::LEFT`].
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub hanging_indent: f32,
+
     /// Range into [`LayoutJob::text`].
     pub byte_range: ByteRange,
 
@@ -360,10 +391,12 @@ impl core::hash::Hash for LayoutSection {
     fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
         let Self {
             leading_space,
+            hanging_indent,
             byte_range,
             format,
         } = self;
         OrderedFloat(*leading_space).hash(state);
+        OrderedFloat(*hanging_indent).hash(state);
         byte_range.hash(state);
         format.hash(state);
     }

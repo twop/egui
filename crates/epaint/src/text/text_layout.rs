@@ -131,10 +131,20 @@ pub(crate) fn layout(fonts: &mut FontsImpl, pixels_per_point: f32, job: Arc<Layo
     let intrinsic_size = calculate_intrinsic_size(point_scale, &job, &paragraphs);
 
     let mut elided = false;
-    let mut rows = rows_from_paragraphs(paragraphs, &job, pixels_per_point, &mut elided);
+    let mut row_indents = Vec::new();
+    let mut rows =
+        rows_from_paragraphs(paragraphs, &job, point_scale, &mut row_indents, &mut elided);
     if elided && let Some(last_placed) = rows.last_mut() {
         let last_row = Arc::make_mut(&mut last_placed.row);
-        replace_last_glyph_with_overflow_character(fonts, pixels_per_point, &job, last_row);
+        let available_width =
+            job.effective_wrap_width() - row_indents.last().copied().unwrap_or(0.0);
+        replace_last_glyph_with_overflow_character(
+            fonts,
+            pixels_per_point,
+            &job,
+            available_width,
+            last_row,
+        );
         if let Some(last) = last_row.glyphs.last() {
             last_row.size.x = last.max_x();
         }
@@ -144,7 +154,7 @@ pub(crate) fn layout(fonts: &mut FontsImpl, pixels_per_point: f32, job: Arc<Layo
 
     if justify || job.halign != Align::LEFT {
         let num_rows = rows.len();
-        for (i, placed_row) in rows.iter_mut().enumerate() {
+        for (i, (placed_row, &indent)) in iter::zip(&mut rows, &row_indents).enumerate() {
             let is_last_row = i + 1 == num_rows;
             let justify_row = justify && !placed_row.ends_with_newline && !is_last_row;
             halign_and_justify_row(
@@ -152,6 +162,7 @@ pub(crate) fn layout(fonts: &mut FontsImpl, pixels_per_point: f32, job: Arc<Layo
                 placed_row,
                 job.halign,
                 job.wrap.max_width,
+                indent,
                 justify_row,
                 job.keep_trailing_whitespace,
             );
@@ -524,6 +535,7 @@ fn layout_section(
 ) -> harfrust::UnicodeBuffer {
     let LayoutSection {
         leading_space,
+        hanging_indent: _, // Used in `line_break`
         byte_range,
         format,
     } = section;
@@ -678,13 +690,41 @@ fn calculate_intrinsic_size(
     intrinsic_size
 }
 
+/// The [`LayoutSection::hanging_indent`] of the wrapped rows of this paragraph, in points.
+fn paragraph_hanging_indent(
+    point_scale: PointScale,
+    job: &LayoutJob,
+    paragraph: &Paragraph,
+) -> f32 {
+    if job.halign != Align::LEFT {
+        return 0.0;
+    }
+    let Some(first_glyph) = paragraph.glyphs.first() else {
+        return 0.0;
+    };
+    // Note: we use the section of the first glyph rather than `paragraph.section_index_at_start`,
+    // since the latter is the section of the preceding `\n`.
+    // This is also what makes this work with `GalleyCache` splitting the job into paragraphs.
+    let hanging_indent = job.sections[first_glyph.section_index as usize].hanging_indent;
+
+    // Leave at least half the wrap width for the text:
+    let hanging_indent = hanging_indent
+        .at_least(0.0)
+        .at_most(job.wrap.max_width * 0.5);
+    point_scale.round_to_pixel(hanging_indent)
+}
+
 // Ignores the Y coordinate.
+//
+// `out_row_indents` gets the hanging indent of each returned row (0 for the first row of each paragraph).
 fn rows_from_paragraphs(
     paragraphs: Vec<Paragraph>,
     job: &LayoutJob,
-    pixels_per_point: f32,
+    point_scale: PointScale,
+    out_row_indents: &mut Vec<f32>,
     elided: &mut bool,
 ) -> Vec<PlacedRow> {
+    let pixels_per_point = point_scale.pixels_per_point();
     let num_paragraphs = paragraphs.len();
 
     let mut rows = vec![];
@@ -698,8 +738,16 @@ fn rows_from_paragraphs(
         let is_last_paragraph = (i + 1) == num_paragraphs;
 
         if paragraph.glyphs.is_empty() {
+            // There are no glyphs to carry the `leading_space`, so we put it in the row position.
+            // This is where the cursor goes on an empty row, e.g. after pressing enter in a list item.
+            let leading_space = if job.halign == Align::LEFT {
+                point_scale.round_to_pixel(paragraph.cursor_x_px / pixels_per_point)
+            } else {
+                0.0
+            };
+            out_row_indents.push(0.0);
             rows.push(PlacedRow {
-                pos: pos2(0.0, f32::NAN),
+                pos: pos2(leading_space, f32::NAN),
                 row: Arc::new(Row {
                     section_index_at_start: paragraph.section_index_at_start,
                     glyphs: vec![],
@@ -715,6 +763,7 @@ fn rows_from_paragraphs(
             let paragraph_width = paragraph.cursor_x_px / pixels_per_point;
             if paragraph_width <= job.effective_wrap_width() {
                 // Early-out optimization: the whole paragraph fits on one row.
+                out_row_indents.push(0.0);
                 rows.push(PlacedRow {
                     pos: pos2(0.0, f32::NAN),
                     row: Arc::new(Row {
@@ -726,20 +775,39 @@ fn rows_from_paragraphs(
                     ends_with_newline: !is_last_paragraph,
                 });
             } else {
-                line_break(&paragraph, job, &mut rows, elided);
+                let hanging_indent = paragraph_hanging_indent(point_scale, job, &paragraph);
+                line_break(
+                    &paragraph,
+                    job,
+                    hanging_indent,
+                    &mut rows,
+                    out_row_indents,
+                    elided,
+                );
                 let placed_row = rows.last_mut().unwrap();
                 placed_row.ends_with_newline = !is_last_paragraph;
             }
         }
     }
 
+    debug_assert_eq!(
+        rows.len(),
+        out_row_indents.len(),
+        "Each row should have an indent"
+    );
+
     rows
 }
 
+/// Break a paragraph into rows.
+///
+/// All rows except the first start at `hanging_indent`, and have that much less space.
 fn line_break(
     paragraph: &Paragraph,
     job: &LayoutJob,
+    hanging_indent: f32,
     out_rows: &mut Vec<PlacedRow>,
+    out_row_indents: &mut Vec<f32>,
     elided: &mut bool,
 ) {
     let wrap_width = job.effective_wrap_width();
@@ -751,6 +819,16 @@ fn line_break(
     let mut row_start_x = 0.0;
     let mut row_start_idx = 0;
 
+    // The first row of this paragraph is at this index of `out_rows`.
+    let first_row_idx = out_rows.len();
+    let current_row_indent = |out_rows: &Vec<PlacedRow>| {
+        if out_rows.len() == first_row_idx {
+            0.0
+        } else {
+            hanging_indent
+        }
+    };
+
     for i in 0..paragraph.glyphs.len() {
         if job.wrap.max_rows <= out_rows.len() {
             *elided = true;
@@ -758,15 +836,17 @@ fn line_break(
         }
 
         let potential_row_width = paragraph.glyphs[i].max_x() - row_start_x;
+        let row_wrap_width = wrap_width - current_row_indent(out_rows);
 
-        if wrap_width < potential_row_width {
+        if row_wrap_width < potential_row_width {
             // Row break:
 
-            if first_row_indentation > 0.0
+            if first_row_indentation > hanging_indent
                 && !row_break_candidates.has_good_candidate(job.wrap.break_anywhere)
             {
                 // Allow the first row to be completely empty, because we know there will be more space on the next row:
                 // TODO(emilk): this records the height of this first row as zero, though that is probably fine since first_row_indentation usually comes with a first_row_min_height.
+                out_row_indents.push(0.0);
                 out_rows.push(PlacedRow {
                     pos: pos2(0.0, f32::NAN),
                     row: Arc::new(Row {
@@ -793,8 +873,10 @@ fn line_break(
                 let section_index_at_start = glyphs[0].section_index;
                 let paragraph_max_x = glyphs.last().unwrap().max_x();
 
+                let row_indent = current_row_indent(out_rows);
+                out_row_indents.push(row_indent);
                 out_rows.push(PlacedRow {
-                    pos: pos2(0.0, f32::NAN),
+                    pos: pos2(row_indent, f32::NAN),
                     row: Arc::new(Row {
                         section_index_at_start,
                         glyphs,
@@ -836,8 +918,10 @@ fn line_break(
 
             let section_index_at_start = glyphs[0].section_index;
 
+            let row_indent = current_row_indent(out_rows);
+            out_row_indents.push(row_indent);
             out_rows.push(PlacedRow {
-                pos: pos2(paragraph_min_x, 0.0),
+                pos: pos2(row_indent + paragraph_min_x, 0.0),
                 row: Arc::new(Row {
                     section_index_at_start,
                     glyphs,
@@ -857,6 +941,7 @@ fn replace_last_glyph_with_overflow_character(
     fonts: &mut FontsImpl,
     pixels_per_point: f32,
     job: &LayoutJob,
+    available_width: f32,
     row: &mut Row,
 ) {
     let Some(overflow_character) = job.wrap.overflow_character else {
@@ -918,9 +1003,7 @@ fn replace_last_glyph_with_overflow_character(
         let replacement_glyph_width = advance_width_px / pixels_per_point;
 
         // Check if we're within width budget:
-        if overflow_glyph_x + replacement_glyph_width <= job.effective_wrap_width()
-            || row.glyphs.is_empty()
-        {
+        if overflow_glyph_x + replacement_glyph_width <= available_width || row.glyphs.is_empty() {
             // we are done
 
             let OutlineGlyph {
@@ -980,6 +1063,7 @@ fn halign_and_justify_row(
     placed_row: &mut PlacedRow,
     halign: Align,
     wrap_width: f32,
+    indent: f32,
     justify: bool,
     keep_trailing_whitespace: bool,
 ) {
@@ -1020,7 +1104,7 @@ fn halign_and_justify_row(
     let original_width = original_max_x - original_min_x;
 
     let target_width = if justify && num_glyphs_in_range > 1 {
-        wrap_width
+        wrap_width - indent
     } else {
         original_width
     };
@@ -1056,7 +1140,7 @@ fn halign_and_justify_row(
             / (num_spaces_in_range as f32);
     }
 
-    placed_row.pos.x = point_scale.round_to_pixel(target_min_x);
+    placed_row.pos.x = indent + point_scale.round_to_pixel(target_min_x);
     let mut translate_x = -original_min_x - extra_x_per_glyph * glyph_range.0 as f32;
 
     for glyph in &mut row.glyphs {
@@ -2714,5 +2798,318 @@ mod tests {
         let glyphs = &galley.rows[0].row.glyphs;
         let details: Vec<_> = glyphs.iter().map(|g| (g.chr, g.advance_width)).collect();
         (galley.size().x, glyphs.len(), details)
+    }
+
+    // ------------------------------------------------------------------------
+    // Hanging indent
+
+    const BULLET: &str = "- a list item with enough words in it that it has to wrap onto more rows";
+    const CONTINUATION: &str = "a continuation after a hard break that also needs to wrap";
+
+    /// One section per line: `(text, leading_space, hanging_indent)`.
+    fn hanging_indent_job(lines: &[(&str, f32, f32)], wrap_width: f32) -> LayoutJob {
+        let mut job = LayoutJob::default();
+        for &(text, leading_space, hanging_indent) in lines {
+            let start = job.text.len();
+            job.text += text;
+            job.sections.push(LayoutSection {
+                leading_space,
+                hanging_indent,
+                byte_range: ByteIndex(start)..ByteIndex(job.text.len()),
+                format: TextFormat::simple(FontId::monospace(14.0), Color32::WHITE),
+            });
+        }
+        job.wrap.max_width = wrap_width;
+        job
+    }
+
+    /// The x of the start of the text of a row, relative to the galley.
+    fn row_text_x(row: &PlacedRow) -> f32 {
+        row.pos.x + row.glyphs.first().map_or(0.0, |g| g.pos.x)
+    }
+
+    /// Group the rows by paragraph (separated by `\n`).
+    fn rows_per_paragraph(galley: &Galley) -> Vec<Vec<&PlacedRow>> {
+        let mut paragraphs = vec![vec![]];
+        for row in &galley.rows {
+            paragraphs.last_mut().unwrap().push(row);
+            if row.ends_with_newline {
+                paragraphs.push(vec![]);
+            }
+        }
+        paragraphs.retain(|rows| !rows.is_empty());
+        paragraphs
+    }
+
+    /// x of the given char in a single-row, unwrapped layout of `text`.
+    fn x_of_char(fonts: &mut FontsImpl, text: &str, char_idx: usize) -> f32 {
+        let job = hanging_indent_job(&[(text, 0.0, 0.0)], f32::INFINITY);
+        let galley = layout(fonts, 1.0, job.into());
+        galley.rows[0].glyphs[char_idx].pos.x
+    }
+
+    #[cfg(feature = "default_fonts")]
+    #[test]
+    fn test_hanging_indent_soft_wrap() {
+        let mut fonts = test_fonts();
+        let wrap_width = 200.0;
+        let indent = x_of_char(&mut fonts, BULLET, 2);
+        assert!(0.0 < indent);
+
+        for justify in [false, true] {
+            let mut job = hanging_indent_job(&[(BULLET, 0.0, indent)], wrap_width);
+            job.justify = justify;
+            let galley = layout(&mut fonts, 1.0, job.clone().into());
+
+            assert!(3 <= galley.rows.len(), "Expected the bullet to wrap");
+            assert_eq!(galley.rows[0].pos.x, 0.0, "justify: {justify}");
+            for row in &galley.rows[1..] {
+                assert_eq!(row.pos.x, indent, "justify: {justify}");
+                assert_eq!(row_text_x(row), indent, "justify: {justify}");
+            }
+            for row in &galley.rows {
+                assert!(
+                    row.rect().max.x <= job.effective_wrap_width(),
+                    "Row {:?} is wider than the wrap width {wrap_width}. justify: {justify}",
+                    row.text()
+                );
+            }
+            assert_eq!(galley.text(), job.text, "The text must not change");
+
+            // Wrapped rows have less space, so we can't need fewer rows than without an indent:
+            job.sections[0].hanging_indent = 0.0;
+            let unindented = layout(&mut fonts, 1.0, job.into());
+            assert!(unindented.rows.len() <= galley.rows.len());
+        }
+    }
+
+    #[cfg(feature = "default_fonts")]
+    #[test]
+    fn test_hanging_indent_hard_break() {
+        let mut fonts = test_fonts();
+        let indent = x_of_char(&mut fonts, BULLET, 2);
+        let job = hanging_indent_job(
+            &[
+                (&format!("{BULLET}\n"), 0.0, indent),
+                (&format!("{CONTINUATION}\n"), indent, indent),
+                ("- next bullet", 0.0, indent),
+            ],
+            200.0,
+        );
+        let galley = layout(&mut fonts, 1.0, job.into());
+        let paragraphs = rows_per_paragraph(&galley);
+        assert_eq!(paragraphs.len(), 3);
+
+        let [bullet, continuation, next_bullet] = &paragraphs[..] else {
+            unreachable!()
+        };
+        assert!(2 <= bullet.len() && 2 <= continuation.len());
+
+        // The bullet starts at zero, and everything after it is aligned with its text:
+        assert_eq!(row_text_x(bullet[0]), 0.0);
+        for row in bullet[1..].iter().chain(continuation) {
+            assert_eq!(row_text_x(row), indent, "Row {:?}", row.text());
+        }
+        assert_eq!(row_text_x(next_bullet[0]), 0.0);
+    }
+
+    #[cfg(feature = "default_fonts")]
+    #[test]
+    fn test_hanging_indent_nested() {
+        let mut fonts = test_fonts();
+        let nested = "  - a nested list item with enough words in it that it also wraps";
+        let outer_indent = x_of_char(&mut fonts, BULLET, 2);
+        let inner_indent = x_of_char(&mut fonts, nested, 4);
+        assert!(outer_indent < inner_indent);
+
+        let job = hanging_indent_job(
+            &[
+                (&format!("{BULLET}\n"), 0.0, outer_indent),
+                (&format!("{nested}\n"), 0.0, inner_indent),
+                (BULLET, 0.0, outer_indent),
+            ],
+            250.0,
+        );
+        let galley = layout(&mut fonts, 1.0, job.into());
+        let paragraphs = rows_per_paragraph(&galley);
+        assert_eq!(paragraphs.len(), 3);
+
+        for (rows, indent) in paragraphs
+            .iter()
+            .zip([outer_indent, inner_indent, outer_indent])
+        {
+            assert!(2 <= rows.len());
+            for row in &rows[1..] {
+                assert_eq!(row_text_x(row), indent, "Row {:?}", row.text());
+            }
+        }
+    }
+
+    #[cfg(feature = "default_fonts")]
+    #[test]
+    fn test_hanging_indent_wider_than_wrap_width() {
+        let mut fonts = test_fonts();
+        let wrap_width = 100.0;
+        for indent in [1000.0, f32::INFINITY] {
+            let job = hanging_indent_job(&[(BULLET, 0.0, indent)], wrap_width);
+            let galley = layout(&mut fonts, 1.0, job.into());
+
+            assert!(2 <= galley.rows.len());
+            for row in &galley.rows[1..] {
+                assert_eq!(row.pos.x, wrap_width / 2.0, "Indent should be clamped");
+            }
+            for row in &galley.rows {
+                assert!(!row.glyphs.is_empty(), "Every row should get some text");
+            }
+        }
+
+        // Negative and NaN are treated as no indent:
+        for indent in [-50.0, f32::NAN] {
+            let job = hanging_indent_job(&[(BULLET, 0.0, indent)], wrap_width);
+            let galley = layout(&mut fonts, 1.0, job.into());
+            for row in &galley.rows {
+                assert_eq!(row.pos.x, 0.0);
+            }
+        }
+    }
+
+    #[cfg(feature = "default_fonts")]
+    #[test]
+    fn test_hanging_indent_ignored_unless_left_aligned() {
+        let mut fonts = test_fonts();
+        for halign in [Align::Center, Align::RIGHT] {
+            let mut job = hanging_indent_job(
+                &[
+                    (&format!("{BULLET}\n"), 0.0, 30.0),
+                    (CONTINUATION, 0.0, 30.0),
+                ],
+                200.0,
+            );
+            job.halign = halign;
+            let indented = layout(&mut fonts, 1.0, job.clone().into());
+
+            for section in &mut job.sections {
+                section.hanging_indent = 0.0;
+            }
+            let unindented = layout(&mut fonts, 1.0, job.into());
+
+            assert_eq!(
+                format!("{:?}", indented.rows),
+                format!("{:?}", unindented.rows),
+                "halign: {halign:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "default_fonts")]
+    #[test]
+    fn test_hanging_indent_elided() {
+        let mut fonts = test_fonts();
+        let indent = 50.0;
+        let mut job = hanging_indent_job(&[(BULLET, 0.0, indent)], 200.0);
+        job.wrap.max_rows = 2;
+        let galley = layout(&mut fonts, 1.0, job.clone().into());
+
+        assert!(galley.elided);
+        assert_eq!(galley.rows.len(), 2);
+        let last_row = &galley.rows[1];
+        assert_eq!(last_row.pos.x, indent);
+        assert_eq!(last_row.glyphs.last().unwrap().chr, '…');
+        assert!(last_row.rect().max.x <= job.effective_wrap_width());
+    }
+
+    /// Pressing enter at the end of a list item creates an empty line,
+    /// and the cursor on it should be at the indent, where the text will go.
+    #[cfg(feature = "default_fonts")]
+    #[test]
+    fn test_leading_space_on_empty_line() {
+        let mut fonts = test_fonts();
+        let indent = 20.0;
+
+        // An empty line in the middle, and one at the end (a zero-length section):
+        let job = hanging_indent_job(
+            &[
+                ("- item\n", 0.0, indent),
+                ("\n", indent, indent),
+                ("- item\n", 0.0, indent),
+                ("", indent, indent),
+            ],
+            200.0,
+        );
+        for split_paragraphs in [false, true] {
+            let galley = super::super::galley_cache::GalleyCache::default().layout(
+                &mut fonts,
+                1.0,
+                job.clone(),
+                split_paragraphs,
+            );
+            assert_eq!(galley.rows.len(), 4);
+
+            for (char_idx, expected_x) in [(0, 0.0), (7, indent), (8, 0.0), (15, indent)] {
+                let cursor = CCursor::new(char_idx);
+                assert_eq!(
+                    galley.pos_from_cursor(cursor).min.x,
+                    expected_x,
+                    "char_idx: {char_idx}, split_paragraphs: {split_paragraphs}"
+                );
+                // Clicking on the row puts the cursor there:
+                let pos = galley.pos_from_cursor(cursor).center().to_vec2();
+                assert_eq!(galley.cursor_from_pos(pos).index, cursor.index);
+            }
+        }
+
+        // Only for left-aligned text, like for rows with text:
+        let mut job = job;
+        job.halign = Align::Center;
+        let galley = layout(&mut fonts, 1.0, job.into());
+        assert_eq!(galley.pos_from_cursor(CCursor::new(7)).min.x, 0.0);
+    }
+
+    #[cfg(feature = "default_fonts")]
+    #[test]
+    fn test_hanging_indent_cursor() {
+        let mut fonts = test_fonts();
+        let indent = x_of_char(&mut fonts, BULLET, 2);
+        let job = hanging_indent_job(
+            &[
+                (&format!("{BULLET}\n"), 0.0, indent),
+                (CONTINUATION, indent, indent),
+            ],
+            200.0,
+        );
+        let galley = layout(&mut fonts, 1.0, job.into());
+        assert!(4 <= galley.rows.len());
+
+        let mut row_start = 0;
+        for (row_idx, row) in galley.rows.iter().enumerate() {
+            let num_chars = row.char_count_excluding_newline().0;
+
+            if 0 < row_idx {
+                // Clicking in the indentation puts the cursor at the start of the row's text:
+                let pos = vec2(1.0, row.rect().center().y);
+                assert_eq!(galley.cursor_from_pos(pos).index, CharIndex(row_start));
+            }
+
+            for column in 0..num_chars {
+                let ccursor = CCursor {
+                    index: CharIndex(row_start + column),
+                    prefer_next_row: true,
+                };
+                let cursor_rect = galley.pos_from_cursor(ccursor);
+                assert_eq!(
+                    cursor_rect.min.x,
+                    row.pos.x + row.glyphs[column].pos.x,
+                    "Row {row_idx}, column {column}"
+                );
+                if 0 < row_idx {
+                    assert!(indent <= cursor_rect.min.x);
+                }
+
+                let hit = galley.cursor_from_pos(cursor_rect.center().to_vec2());
+                assert_eq!(hit.index, ccursor.index, "Row {row_idx}, column {column}");
+            }
+
+            row_start += row.char_count_including_newline().0;
+        }
     }
 }
